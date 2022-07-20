@@ -1013,11 +1013,35 @@ size_t fvec_L2sqr_ny_nearest(
 }
 
 float fvec_L1(const float* x, const float* y, size_t d) {
-    return fvec_L1_ref(x, y, d);
+    float32x4_t accux4 = vdupq_n_f32(0);
+    const size_t d_simd = d - (d & 3);
+    size_t i;
+    for (i = 0; i < d_simd; i += 4) {
+        float32x4_t xi = vld1q_f32(x + i);
+        float32x4_t yi = vld1q_f32(y + i);
+        accux4 = vaddq_f32(accux4, vabdq_f32(xi, yi));
+    }
+    float32_t accux1 = vaddvq_f32(accux4);
+    for (; i < d; ++i) {
+        accux1 += fabs(x[i] - y[i]);
+    }
+    return accux1;
 }
 
 float fvec_Linf(const float* x, const float* y, size_t d) {
-    return fvec_Linf_ref(x, y, d);
+    float32x4_t accux4 = vdupq_n_f32(0);
+    const size_t d_simd = d - (d & 3);
+    size_t i;
+    for (i = 0; i < d_simd; i += 4) {
+        float32x4_t xi = vld1q_f32(x + i);
+        float32x4_t yi = vld1q_f32(y + i);
+        accux4 = vmaxq_f32(accux4, vabdq_f32(xi, yi));
+    }
+    float32_t accux1 = vmaxvq_f32(accux4);
+    for (; i < d; ++i) {
+        accux1 = fmax(accux1, fabs(x[i] - y[i]));
+    }
+    return accux1;
 }
 
 void fvec_inner_products_ny(
