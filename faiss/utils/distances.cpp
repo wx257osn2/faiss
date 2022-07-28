@@ -19,6 +19,8 @@
 
 #ifdef __AVX2__
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 #include <faiss/impl/AuxIndexStructures.h>
@@ -470,6 +472,189 @@ void exhaustive_L2sqr_blas<SingleBestResultHandler<CMax<float, int64_t>>>(
                     //    due to roundoff errors.
                     if (distance_candidate < 0)
                         distance_candidate = 0;
+
+                    int64_t index_candidate = min_indices_scalar[jv] + j0;
+
+                    if (current_min_distance > distance_candidate) {
+                        current_min_distance = distance_candidate;
+                        current_min_index = index_candidate;
+                    } else if (
+                            current_min_distance == distance_candidate &&
+                            current_min_index > index_candidate) {
+                        current_min_index = index_candidate;
+                    }
+                }
+
+                // process leftovers
+                for (; idx_j < count; idx_j++, ip_line++) {
+                    float ip = *ip_line;
+                    float dis = x_norms[i] + y_norms[idx_j + j0] - 2 * ip;
+                    // negative values can occur for identical vectors
+                    //    due to roundoff errors.
+                    if (dis < 0)
+                        dis = 0;
+
+                    if (current_min_distance > dis) {
+                        current_min_distance = dis;
+                        current_min_index = idx_j + j0;
+                    }
+                }
+
+                //
+                res.add_result(i, current_min_distance, current_min_index);
+            }
+        }
+        InterruptCallback::check();
+    }
+}
+#elif defined(__aarch64__)
+// an override for ARM SIMD if only a single closest point is needed.
+template <>
+void exhaustive_L2sqr_blas<SingleBestResultHandler<CMax<float, int64_t>>>(
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t nx,
+        size_t ny,
+        SingleBestResultHandler<CMax<float, int64_t>>& res,
+        const float* y_norms) {
+    // BLAS does not like empty matrices
+    if (nx == 0 || ny == 0)
+        return;
+
+    /* block sizes */
+    const size_t bs_x = distance_compute_blas_query_bs;
+    const size_t bs_y = distance_compute_blas_database_bs;
+    // const size_t bs_x = 16, bs_y = 16;
+    std::unique_ptr<float[]> ip_block(new float[bs_x * bs_y]);
+    std::unique_ptr<float[]> x_norms(new float[nx]);
+    std::unique_ptr<float[]> del2;
+
+    fvec_norms_L2sqr(x_norms.get(), x, d, nx);
+
+    if (!y_norms) {
+        float* y_norms2 = new float[ny];
+        del2.reset(y_norms2);
+        fvec_norms_L2sqr(y_norms2, y, d, ny);
+        y_norms = y_norms2;
+    }
+
+    for (size_t i0 = 0; i0 < nx; i0 += bs_x) {
+        size_t i1 = i0 + bs_x;
+        if (i1 > nx)
+            i1 = nx;
+
+        res.begin_multiple(i0, i1);
+
+        for (size_t j0 = 0; j0 < ny; j0 += bs_y) {
+            size_t j1 = j0 + bs_y;
+            if (j1 > ny)
+                j1 = ny;
+            /* compute the actual dot products */
+            {
+                float one = 1, zero = 0;
+                FINTEGER nyi = j1 - j0, nxi = i1 - i0, di = d;
+                sgemm_("Transpose",
+                       "Not transpose",
+                       &nyi,
+                       &nxi,
+                       &di,
+                       &one,
+                       y + j0 * d,
+                       &di,
+                       x + i0 * d,
+                       &di,
+                       &zero,
+                       ip_block.get(),
+                       &nyi);
+            }
+#pragma omp parallel for
+            for (int64_t i = i0; i < i1; i++) {
+                float* ip_line = ip_block.get() + (i - i0) * (j1 - j0);
+
+                // constant
+                const auto mul_minus2 = vdupq_n_f32(-2.f);
+
+                // Track 4 min distances + 4 min indices.
+                // All the distances tracked do not take x_norms[i]
+                //   into account in order to get rid of extra
+                //   vaddq_f32(x_norms[i], ...) instructions
+                //   is distance computations.
+                auto min_distances =
+                        vdupq_n_f32(res.dis_tab[i] - x_norms[i]);
+
+                // these indices are local and are relative to j0.
+                // so, value 0 means j0.
+                auto min_indices = vdupq_n_u32(0u);
+
+                static constexpr uint32_t indices[] = {0u, 1u, 2u, 3u};
+                auto current_indices = vld1q_u32(indices);
+                const auto indices_delta = vdupq_n_u32(4u);
+
+                // current j index
+                size_t idx_j = 0;
+                size_t count = j1 - j0;
+
+                // process 8 elements per loop
+                for (; idx_j < (count / 8) * 8; idx_j += 8, ip_line += 8) {
+                    // load values for norms
+                    const auto y_norm_0 = vld1q_f32(y_norms + idx_j + j0 + 0);
+                    const auto y_norm_1 = vld1q_f32(y_norms + idx_j + j0 + 4);
+
+                    // load values for dot products
+                    const auto ip_0 = vld1q_f32(ip_line + 0);
+                    const auto ip_1 = vld1q_f32(ip_line + 4);
+
+
+                    // compute dis = y_norm[j] - 2 * dot(x_norm[i], y_norm[j]).
+                    // x_norm[i] was dropped off because it is a constant for a
+                    // given i. We'll deal with it later.
+                    const auto distances_0 = vfmaq_f32(y_norm_0, mul_minus2, ip_0);
+                    const auto distances_1 = vfmaq_f32(y_norm_1, mul_minus2, ip_1);
+
+                    // compare the new distances to the min distances
+                    // for each of the first group of 4 ARM SIMD components.
+                    auto comparison = vcleq_f32(min_distances, distances_0);
+
+                    // update min distances and indices with closest vectors if
+                    // needed.
+                    min_distances = vbslq_f32(comparison, min_distances, distances_0);
+                    min_indices = vbslq_u32(comparison, min_indices, current_indices);
+                    current_indices = vaddq_u32(current_indices, indices_delta);
+
+                    // compare the new distances to the min distances
+                    // for each of the second group of 4 ARM SIMD components.
+                    comparison = vcleq_f32(min_distances, distances_1);
+
+                    // update min distances and indices with closest vectors if
+                    // needed.
+                    min_distances = vbslq_f32(comparison, min_distances, distances_1);
+                    min_indices = vbslq_u32(comparison, min_indices, current_indices);
+                    current_indices = vaddq_u32(current_indices, indices_delta);
+                }
+
+                // dump values and find the minimum distance / minimum index
+                float min_distances_scalar[4];
+                uint32_t min_indices_scalar[4];
+                vst1q_f32(min_distances_scalar, min_distances);
+                vst1q_u32(min_indices_scalar, min_indices);
+
+                float current_min_distance = res.dis_tab[i];
+                uint32_t current_min_index = res.ids_tab[i];
+
+                // This unusual comparison is needed to maintain the behavior
+                // of the original implementation: if two indices are
+                // represented with equal distance values, then
+                // the index with the min value is returned.
+                for (size_t jv = 0; jv < 4; jv++) {
+                    // add missing x_norms[i]
+                    float distance_candidate =
+                            min_distances_scalar[jv] + x_norms[i];
+
+                    // negative values can occur for identical vectors
+                    //    due to roundoff errors.
+                    if (distance_candidate < 0.f)
+                        distance_candidate = 0.f;
 
                     int64_t index_candidate = min_indices_scalar[jv] + j0;
 
